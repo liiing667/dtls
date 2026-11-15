@@ -436,6 +436,10 @@ func (c *flightTestConn) SessionKey() []byte {
 	return nil
 }
 
+func (c *flightTestConn) RemoteAddr() net.Addr {
+	return nil
+}
+
 const keyLogEarlyData = "early"
 
 func TestKeyLog(t *testing.T) {

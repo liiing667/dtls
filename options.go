@@ -22,6 +22,7 @@ import (
 
 	"github.com/pion/dtls/v4/internal/ciphersuite"
 	dtlsconfig "github.com/pion/dtls/v4/internal/config"
+	dtlscookie "github.com/pion/dtls/v4/internal/cookie"
 	"github.com/pion/dtls/v4/internal/ech"
 	dtlserrors "github.com/pion/dtls/v4/internal/errors"
 	dtlsnet "github.com/pion/dtls/v4/internal/net"
@@ -93,6 +94,10 @@ type dtlsConfig struct {
 	OnConnectionAttempt           func(net.Addr) error
 	MinVersion                    protocol.Version
 	MaxVersion                    protocol.Version
+	// dtls13CookieKeys are the shared keys for stateless DTLS 1.3
+	// HelloRetryRequest cookies. The first key signs new cookies and all
+	// keys remain valid for verification, supporting key rotation.
+	dtls13CookieKeys [][]byte
 
 	customCipherSuites   func() []cryptosuite.Suite
 	pskClient            PSKClientCallback
@@ -622,6 +627,30 @@ func WithInsecureSkipVerifyHello(skip bool) ServerOption {
 	return serverOnlyOption(valueOption(func(c *dtlsConfig) *bool { return &c.InsecureSkipVerifyHello }, skip))
 }
 
+// WithDTLS13CookieKeys sets the shared keys used to authenticate stateless
+// DTLS 1.3 HelloRetryRequest cookies. Keys must each be 16 to 64 bytes. The
+// first key signs new cookies; every key remains valid for verification, so
+// rotation is performed by prepending a new key and removing the oldest key
+// once the previous cookie lifetime has elapsed. When unset, each server
+// connection generates an ephemeral random key.
+// This option is only applicable to servers.
+func WithDTLS13CookieKeys(keys ...[]byte) ServerOption {
+	return serverOnlyOption(func(config *dtlsConfig) error {
+		if len(keys) == 0 {
+			return dtlscookie.ErrNoKeys
+		}
+		config.dtls13CookieKeys = make([][]byte, 0, len(keys))
+		for _, key := range keys {
+			if len(key) < 16 || len(key) > 64 {
+				return dtlscookie.ErrInvalidKey
+			}
+			config.dtls13CookieKeys = append(config.dtls13CookieKeys, bytes.Clone(key))
+		}
+
+		return nil
+	})
+}
+
 // WithServerHelloMessageHook sets the server hello message hook for DTLS 1.2 and 1.3.
 // For DTLS 1.3, the hook is also called for HelloRetryRequest. It must preserve
 // the selected version, cipher suite, key share, PSK identity, and retry cookie.
@@ -919,6 +948,10 @@ func newHandshakeConfig(config *dtlsConfig, configValues connConfigValues, resum
 		ResumeState:                   resumeState,
 		MinVersion:                    configValues.minVersion,
 		MaxVersion:                    configValues.maxVersion,
+	}
+	if len(config.dtls13CookieKeys) > 0 {
+		cookieGenerator, _ := dtlscookie.NewGenerator(config.dtls13CookieKeys)
+		handshakeConfig.DTLS13CookieGenerator = cookieGenerator
 	}
 	// Preserve an explicit ECH minimum for handshake validation, even when
 	// cipher-suite filtering narrowed the effective range to DTLS 1.3.

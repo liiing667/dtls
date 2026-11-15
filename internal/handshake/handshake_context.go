@@ -86,7 +86,9 @@ func (c *handshakeContext) rejectECH(ctx context.Context, conn Conn) error {
 }
 
 func (c *handshakeContext) parseReceivedFlight(ctx context.Context, conn Conn, currentFlight dtlsflight13.Flight) (dtlsflight13.Flight, error) {
-	nextFlight, dtlsAlert, err, ok := dtlsflight13.Parse(ctx, currentFlight, conn, c.parseDependencies())
+	dependencies := c.parseDependencies()
+	dependencies.RemoteAddr = conn.RemoteAddr()
+	nextFlight, dtlsAlert, err, ok := dtlsflight13.Parse(ctx, currentFlight, conn, dependencies)
 	c.flushPendingEarlyKeyLog()
 	if !ok {
 		if alertErr := conn.Notify(ctx, alert.Fatal, alert.InternalError); alertErr != nil {

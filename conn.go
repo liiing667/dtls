@@ -193,6 +193,10 @@ func (c handshakeConn) SessionKey() []byte {
 	return c.conn.sessionKey()
 }
 
+func (c handshakeConn) RemoteAddr() net.Addr {
+	return c.conn.rAddr
+}
+
 func adaptFlightConn(conn *Conn) dtlsflight.Conn {
 	if conn == nil {
 		return nil

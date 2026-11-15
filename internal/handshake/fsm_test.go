@@ -11,6 +11,7 @@ import (
 	"encoding/hex"
 	"fmt"
 	"math"
+	"net"
 	"testing"
 	"time"
 
@@ -74,6 +75,7 @@ type flightTestConn struct {
 	recvHandshake       chan RecvHandshakeState
 	writtenPackets      []*dtlsflight.Outbound
 	pendingACKs         []protocol.RecordNumber
+	remoteAddr          net.Addr
 }
 
 type handshakeTestTimer struct {
@@ -131,6 +133,10 @@ func (c *flightTestConn) HandleQueuedPackets(ctx context.Context) error {
 
 func (c *flightTestConn) SessionKey() []byte {
 	return nil
+}
+
+func (c *flightTestConn) RemoteAddr() net.Addr {
+	return c.remoteAddr
 }
 
 func newTestState13(t *testing.T, isClient bool) *dtlsstate.State13 {

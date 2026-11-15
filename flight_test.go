@@ -15,12 +15,14 @@ import (
 	"crypto/x509"
 	"errors"
 	"hash"
+	"net"
 	"slices"
 	"testing"
 	"time"
 
 	"github.com/pion/dtls/v4/internal/ciphersuite"
 	dtlsconfig "github.com/pion/dtls/v4/internal/config"
+	dtlscookie "github.com/pion/dtls/v4/internal/cookie"
 	dtlserrors "github.com/pion/dtls/v4/internal/errors"
 	dtlsflight "github.com/pion/dtls/v4/internal/flight"
 	dtlsflight12 "github.com/pion/dtls/v4/internal/flight/flight12"
@@ -68,6 +70,35 @@ var (
 	errFlight13ConnectionCallbackRejected   = errors.New("connection callback rejected")
 	errFlight13ServerIdentityCallbackReject = errors.New("identity callback rejected")
 )
+
+// fixedCookieTime is the deterministic clock used by stateless cookie tests.
+//
+//nolint:gochecknoglobals
+var fixedCookieTime = time.Date(2026, 1, 2, 3, 4, 5, 0, time.UTC)
+
+func newFixedCookieGenerator(t *testing.T, keys ...[]byte) *dtlscookie.Generator {
+	t.Helper()
+	if len(keys) == 0 {
+		keys = [][]byte{bytes.Repeat([]byte{0x42}, 16)}
+	}
+	now := fixedCookieTime
+	generator, err := dtlscookie.NewGenerator(keys, dtlscookie.WithClock(func() time.Time { return now }))
+	require.NoError(t, err)
+
+	return generator
+}
+
+func testUDPAddr(port int) *net.UDPAddr {
+	return &net.UDPAddr{IP: net.IPv4(192, 0, 2, 10), Port: port}
+}
+
+func initialClientHelloDigestForTest(t *testing.T, cfg *dtlsconfig.HandshakeConfig, snapshot negotiation.ClientHelloSnapshot) []byte {
+	t.Helper()
+	hash := cfg.LocalCipherSuites[0].HashFunc()()
+	hash.Write(snapshot.Body())
+
+	return hash.Sum(nil)
+}
 
 type handshakeTestContext13 struct {
 	state      *dtlsstate.State13
@@ -148,6 +179,7 @@ func flight13ParseForTestWithConn(testingT require.TestingT, flight dtlsflight13
 
 type flight13QueuedPacketConn struct {
 	handleQueuedPackets func(context.Context) error
+	remoteAddr          net.Addr
 }
 
 func (c *flight13QueuedPacketConn) HandleQueuedPackets(ctx context.Context) error {
@@ -160,6 +192,10 @@ func (c *flight13QueuedPacketConn) HandleQueuedPackets(ctx context.Context) erro
 
 func (c *flight13QueuedPacketConn) SessionKey() []byte {
 	return nil
+}
+
+func (c *flight13QueuedPacketConn) RemoteAddr() net.Addr {
+	return c.remoteAddr
 }
 
 func flight13GenerateForTest(testingT require.TestingT, flight dtlsflight13.Flight, flightCtx *handshakeTestContext13) ([]*dtlsflight.Outbound, *alert.Alert, error) {
@@ -2085,6 +2121,7 @@ func TestFlight13_2Generate(t *testing.T) {
 	t.Run("RejectsHelloRetryRequestWithNoEffect", func(t *testing.T) {
 		state := newTestState13(t, false)
 		cfg := testHandshakeConfig13(t)
+		cfg.InsecureSkipHelloVerify = true
 		state.CipherSuite = cfg.LocalCipherSuites[0]
 
 		packets, dtlsAlert, err := flight13GenerateForTest(t, dtlsflight13.Flight2, flight13_2Context(state, dtlsflight.NewCache(), cfg))
@@ -2123,24 +2160,25 @@ func TestFlight13_2Generate(t *testing.T) {
 	})
 
 	t.Run("IncludesCookieWhenSet", func(t *testing.T) {
-		cookie := []byte{0x01, 0x02, 0x03, 0x04}
 		state := newTestState13(t, false)
-		state.Cookie = cookie
 		cfg := testHandshakeConfig13(t)
+		cfg.DTLS13CookieGenerator = newFixedCookieGenerator(t)
+		state.CipherSuite = cfg.LocalCipherSuites[0]
 
 		serverHello := serverHelloFromFlight13_2(t, state, cfg)
 
 		cookieExt, ok := findCookie(serverHello.Extensions)
 		require.True(t, ok, "Cookie must be present when set on state")
-		assert.Equal(t, cookie, cookieExt.Cookie)
+		assert.Len(t, cookieExt.Cookie, dtlscookie.Length)
+		assert.Equal(t, state.Cookie, cookieExt.Cookie)
 	})
 
 	t.Run("IncludesAllExtensionsTogether", func(t *testing.T) {
-		cookie := []byte{0xaa, 0xbb}
 		state := newTestState13(t, false)
 		state.SelectedGroup = elliptic.P256
-		state.Cookie = cookie
 		cfg := testHandshakeConfig13(t)
+		cfg.DTLS13CookieGenerator = newFixedCookieGenerator(t)
+		state.CipherSuite = cfg.LocalCipherSuites[0]
 
 		serverHello := serverHelloFromFlight13_2(t, state, cfg)
 
@@ -2156,7 +2194,8 @@ func TestFlight13_2Generate(t *testing.T) {
 
 		cookieExt, ok := findCookie(serverHello.Extensions)
 		require.True(t, ok)
-		assert.Equal(t, cookie, cookieExt.Cookie)
+		assert.Len(t, cookieExt.Cookie, dtlscookie.Length)
+		assert.Equal(t, state.Cookie, cookieExt.Cookie)
 	})
 }
 
@@ -2394,30 +2433,62 @@ func TestFlight13_2Parse(t *testing.T) {
 
 	t.Run("AdvancesToFlight4OnMatchingCookie", func(t *testing.T) {
 		state := newTestState13(t, false)
-		state.Cookie = cookie
-		cache := dtlsflight.NewCache()
 		cfg := testHandshakeConfig13(t)
+		cfg.DTLS13CookieGenerator = newFixedCookieGenerator(t)
+		state.CipherSuite = cfg.LocalCipherSuites[0]
+		state.HandshakeRecvSequence = 1
+		addr := testUDPAddr(4444)
 
-		exts := append(requiredClientHello13Extensions(t, cfg), &extension13.Cookie{Cookie: cookie})
-		pushClientHello13(t, cache, protocol.Version1_2, exts)
+		initialClientHello := &handshake.MessageClientHello{
+			Version:            protocol.Version1_2,
+			CipherSuiteIDs:     []uint16{uint16(cryptosuite.TLS_AES_128_GCM_SHA256)},
+			CompressionMethods: dtlsflight.DefaultCompressionMethods(),
+			Extensions:         requiredClientHello13Extensions(t, cfg),
+		}
+		_, initialSnapshot, err := negotiation.FinalizeClientHello(initialClientHello, nil)
+		require.NoError(t, err)
+		state.RemoteClientHelloSnapshots.Reset()
+		require.NoError(t, state.RemoteClientHelloSnapshots.Record(initialSnapshot))
 
-		next, dtlsAlert, err := flight13ParseForTest(t, dtlsflight13.Flight2, context.Background(), flight13_2Context(state, cache, cfg))
+		statelessCookie, err := cfg.DTLS13CookieGenerator.Generate(addr, initialClientHelloDigestForTest(t, cfg, initialSnapshot))
+		require.NoError(t, err)
+		state.Cookie = statelessCookie
+
+		cache := dtlsflight.NewCache()
+		id := uint16(cfg.LocalCipherSuites[0].ID())
+		retryRequest, err := negotiation.ValidateHelloRetryRequest(initialSnapshot, &handshake.MessageServerHello{
+			CipherSuiteID: &id,
+			Extensions:    []extension.Value{&extension13.SelectedVersion{Version: protocol.Version1_3}, &extension13.Cookie{Cookie: statelessCookie}},
+		})
+		require.NoError(t, err)
+		state.HelloRetryRequest = retryRequest
+		retryClientHello, err := negotiation.BuildClientHelloRetry(initialSnapshot, retryRequest, nil)
+		require.NoError(t, err)
+		rawRetry, err := (&handshake.Handshake{Header: handshake.Header{MessageSequence: 1}, Message: retryClientHello}).Marshal()
+		require.NoError(t, err)
+		cache.Push(rawRetry, 0, 1, handshake.TypeClientHello, true)
+		flightCtx := &handshakeTestContext13{state: state, cache: cache, cfg: cfg, transcript: dtlshandshake.NewTranscript()}
+
+		conn := &flight13QueuedPacketConn{remoteAddr: addr}
+		next, dtlsAlert, err := flight13ParseForTestWithConn(t, dtlsflight13.Flight2, context.Background(), conn, flightCtx)
 		require.NoError(t, err)
 		require.Nil(t, dtlsAlert)
 		assert.Equal(t, dtlsflight13.Flight4, next)
-		assert.Equal(t, 1, state.HandshakeRecvSequence)
+		assert.Equal(t, 2, state.HandshakeRecvSequence)
 	})
 
 	t.Run("GeneratesX25519MLKEM768KeypairAfterMatchingCookie", func(t *testing.T) {
 		cfg := testHandshakeConfig13(t)
 		cfg.EllipticCurves = []elliptic.Curve{elliptic.X25519MLKEM768}
+		cfg.DTLS13CookieGenerator = newFixedCookieGenerator(t)
 		clientKeypair, err := elliptic.GenerateKeypair(elliptic.X25519MLKEM768)
 		require.NoError(t, err)
 
 		state := newTestState13(t, false)
-		state.Cookie = cookie
-		cache := dtlsflight.NewCache()
-		pushClientHello13(t, cache, protocol.Version1_2, []extension.Value{
+		state.CipherSuite = cfg.LocalCipherSuites[0]
+		state.HandshakeRecvSequence = 1
+		addr := testUDPAddr(5555)
+		initialExtensions := []extension.Value{
 			&extension.SignatureAlgorithms{Schemes: dtlsflight.SignatureSchemeIDs(cfg.LocalSignatureSchemes)},
 			&extension.SupportedGroups{Groups: cfg.EllipticCurves},
 			&extension13.ClientKeyShare{
@@ -2426,10 +2497,37 @@ func TestFlight13_2Parse(t *testing.T) {
 				},
 			},
 			&extension13.OfferedVersions{Versions: []protocol.Version{protocol.Version1_3}},
-			&extension13.Cookie{Cookie: cookie},
-		})
+		}
+		initialClientHello := &handshake.MessageClientHello{
+			Version:            protocol.Version1_2,
+			CipherSuiteIDs:     []uint16{uint16(cryptosuite.TLS_AES_128_GCM_SHA256)},
+			CompressionMethods: dtlsflight.DefaultCompressionMethods(),
+			Extensions:         initialExtensions,
+		}
+		_, initialSnapshot, err := negotiation.FinalizeClientHello(initialClientHello, nil)
+		require.NoError(t, err)
+		state.RemoteClientHelloSnapshots.Reset()
+		require.NoError(t, state.RemoteClientHelloSnapshots.Record(initialSnapshot))
+		statelessCookie, err := cfg.DTLS13CookieGenerator.Generate(addr, initialClientHelloDigestForTest(t, cfg, initialSnapshot))
+		require.NoError(t, err)
+		state.Cookie = statelessCookie
 
-		next, dtlsAlert, err := flight13ParseForTest(t, dtlsflight13.Flight2, context.Background(), flight13_2Context(state, cache, cfg))
+		cache := dtlsflight.NewCache()
+		id := uint16(cfg.LocalCipherSuites[0].ID())
+		retryRequest, err := negotiation.ValidateHelloRetryRequest(initialSnapshot, &handshake.MessageServerHello{
+			CipherSuiteID: &id,
+			Extensions:    []extension.Value{&extension13.SelectedVersion{Version: protocol.Version1_3}, &extension13.Cookie{Cookie: statelessCookie}},
+		})
+		require.NoError(t, err)
+		state.HelloRetryRequest = retryRequest
+		retryClientHello, err := negotiation.BuildClientHelloRetry(initialSnapshot, retryRequest, nil)
+		require.NoError(t, err)
+		rawRetry, err := (&handshake.Handshake{Header: handshake.Header{MessageSequence: 1}, Message: retryClientHello}).Marshal()
+		require.NoError(t, err)
+		cache.Push(rawRetry, 0, 1, handshake.TypeClientHello, true)
+		flightCtx := &handshakeTestContext13{state: state, cache: cache, cfg: cfg, transcript: dtlshandshake.NewTranscript()}
+
+		next, dtlsAlert, err := flight13ParseForTestWithConn(t, dtlsflight13.Flight2, context.Background(), &flight13QueuedPacketConn{remoteAddr: addr}, flightCtx)
 		require.NoError(t, err)
 		require.Nil(t, dtlsAlert)
 		assert.Equal(t, dtlsflight13.Flight4, next)
@@ -2447,13 +2545,15 @@ func TestFlight13_2Parse(t *testing.T) {
 	t.Run("RejectsUnsupportedSupportedGroupsAfterMatchingCookie", func(t *testing.T) {
 		cfg := testHandshakeConfig13(t)
 		cfg.EllipticCurves = []elliptic.Curve{elliptic.P256}
+		cfg.DTLS13CookieGenerator = newFixedCookieGenerator(t)
 		clientKeypair, err := elliptic.GenerateKeypair(elliptic.P384)
 		require.NoError(t, err)
 
 		state := newTestState13(t, false)
-		state.Cookie = cookie
-		cache := dtlsflight.NewCache()
-		pushClientHello13(t, cache, protocol.Version1_2, []extension.Value{
+		state.CipherSuite = cfg.LocalCipherSuites[0]
+		state.HandshakeRecvSequence = 1
+		addr := testUDPAddr(6666)
+		initialExtensions := []extension.Value{
 			&extension.SignatureAlgorithms{Schemes: dtlsflight.SignatureSchemeIDs(cfg.LocalSignatureSchemes)},
 			&extension.SupportedGroups{Groups: []elliptic.Curve{elliptic.P384}},
 			&extension13.ClientKeyShare{
@@ -2462,10 +2562,38 @@ func TestFlight13_2Parse(t *testing.T) {
 				},
 			},
 			&extension13.OfferedVersions{Versions: []protocol.Version{protocol.Version1_3}},
-			&extension13.Cookie{Cookie: cookie},
-		})
+		}
+		initialClientHello := &handshake.MessageClientHello{
+			Version:            protocol.Version1_2,
+			CipherSuiteIDs:     []uint16{uint16(cryptosuite.TLS_AES_128_GCM_SHA256)},
+			CompressionMethods: dtlsflight.DefaultCompressionMethods(),
+			Extensions:         initialExtensions,
+		}
+		_, initialSnapshot, err := negotiation.FinalizeClientHello(initialClientHello, nil)
+		require.NoError(t, err)
+		state.RemoteClientHelloSnapshots.Reset()
+		require.NoError(t, state.RemoteClientHelloSnapshots.Record(initialSnapshot))
+		statelessCookie, err := cfg.DTLS13CookieGenerator.Generate(addr, initialClientHelloDigestForTest(t, cfg, initialSnapshot))
+		require.NoError(t, err)
+		state.Cookie = statelessCookie
 
-		next, dtlsAlert, err := flight13ParseForTest(t, dtlsflight13.Flight2, context.Background(), flight13_2Context(state, cache, cfg))
+		id := uint16(cfg.LocalCipherSuites[0].ID())
+		retryRequest, err := negotiation.ValidateHelloRetryRequest(initialSnapshot, &handshake.MessageServerHello{
+			CipherSuiteID: &id,
+			Extensions:    []extension.Value{&extension13.SelectedVersion{Version: protocol.Version1_3}, &extension13.Cookie{Cookie: statelessCookie}},
+		})
+		require.NoError(t, err)
+		state.HelloRetryRequest = retryRequest
+		retryClientHello, err := negotiation.BuildClientHelloRetry(initialSnapshot, retryRequest, nil)
+		require.NoError(t, err)
+
+		cache := dtlsflight.NewCache()
+		rawRetry, err := (&handshake.Handshake{Header: handshake.Header{MessageSequence: 1}, Message: retryClientHello}).Marshal()
+		require.NoError(t, err)
+		cache.Push(rawRetry, 0, 1, handshake.TypeClientHello, true)
+		flightCtx := &handshakeTestContext13{state: state, cache: cache, cfg: cfg, transcript: dtlshandshake.NewTranscript()}
+
+		next, dtlsAlert, err := flight13ParseForTestWithConn(t, dtlsflight13.Flight2, context.Background(), &flight13QueuedPacketConn{remoteAddr: addr}, flightCtx)
 		require.ErrorIs(t, err, dtlserrors.ErrNoSupportedEllipticCurves)
 		assert.Equal(t, dtlsflight13.Flight(0), next)
 		require.NotNil(t, dtlsAlert)
@@ -2544,6 +2672,7 @@ func TestFlight13_2Parse(t *testing.T) {
 			state.Cookie = cookie
 			cache := dtlsflight.NewCache()
 			cfg := testHandshakeConfig13(t)
+			cfg.InsecureSkipHelloVerify = true
 			pushClientHello13(t, cache, test.version, []extension.Value{&extension13.Cookie{Cookie: cookie}})
 
 			next, dtlsAlert, err := flight13ParseForTest(t, dtlsflight13.Flight2, context.Background(), flight13_2Context(state, cache, cfg))
@@ -2851,6 +2980,7 @@ func TestFlight13_2ParseConnectionIDOffer(t *testing.T) {
 	for name, test := range tests {
 		t.Run(name, func(t *testing.T) {
 			cfg := testHandshakeConfig13(t)
+			cfg.InsecureSkipHelloVerify = true
 			state := newTestState13(t, false)
 			state.Cookie = cookie
 			initialExtensions := requiredClientHello13Extensions(t, cfg)

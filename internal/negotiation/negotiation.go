@@ -26,6 +26,9 @@ type ClientHelloSnapshot struct {
 // Valid reports whether the snapshot contains a ClientHello.
 func (s ClientHelloSnapshot) Valid() bool { return len(s.body) != 0 }
 
+// Body returns the retained ClientHello handshake body.
+func (s ClientHelloSnapshot) Body() []byte { return bytes.Clone(s.body) }
+
 // Extension returns a copy of the extension with typ.
 func (s ClientHelloSnapshot) Extension(typ extension.Type) (extension.Raw, bool) {
 	for _, raw := range s.extensions {

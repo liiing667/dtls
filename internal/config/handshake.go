@@ -22,6 +22,7 @@ import (
 	"sync"
 	"time"
 
+	"github.com/pion/dtls/v4/internal/cookie"
 	"github.com/pion/dtls/v4/internal/ech"
 	dtlserrors "github.com/pion/dtls/v4/internal/errors"
 	dtlscrypto "github.com/pion/dtls/v4/internal/handshakecrypto"
@@ -184,6 +185,11 @@ type HandshakeConfig struct {
 	MinVersion                    protocol.Version
 	MaxVersion                    protocol.Version
 	TimerFactory                  func(time.Duration) Timer
+	// DTLS13CookieGenerator issues and validates stateless DTLS 1.3
+	// HelloRetryRequest cookies. When nil the DTLS 1.3 server creates a
+	// per-handshake random key, which still validates cookies within one
+	// connection but does not survive process or connection restarts.
+	DTLS13CookieGenerator *cookie.Generator
 
 	nameToCertificate map[string]*tls.Certificate
 	mu                sync.Mutex

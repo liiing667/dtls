@@ -6,6 +6,7 @@ package flight
 import (
 	"context"
 	"crypto"
+	"net"
 
 	"github.com/pion/dtls/v4/pkg/protocol"
 	"github.com/pion/dtls/v4/pkg/protocol/handshake"
@@ -14,6 +15,7 @@ import (
 type Conn interface {
 	HandleQueuedPackets(context.Context) error
 	SessionKey() []byte
+	RemoteAddr() net.Addr
 }
 
 // Protection describes the protection required for an outbound

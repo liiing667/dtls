@@ -16,6 +16,7 @@ import (
 	"time"
 
 	dtlsconfig "github.com/pion/dtls/v4/internal/config"
+	dtlscookie "github.com/pion/dtls/v4/internal/cookie"
 	"github.com/pion/dtls/v4/internal/ech"
 	dtlserrors "github.com/pion/dtls/v4/internal/errors"
 	dtlsnet "github.com/pion/dtls/v4/internal/net"
@@ -229,6 +230,42 @@ func TestPacketListenerOptionsReuseInferredConnectionIDLength(t *testing.T) {
 
 // TestServerOnlyNilCallbackOptionsReturnError verifies server-only options
 // return errors for nil callbacks.
+func TestDTLS13CookieKeysOption(t *testing.T) {
+	primary := bytes.Repeat([]byte{0x42}, 32)
+	secondary := bytes.Repeat([]byte{0x07}, 32)
+
+	t.Run("accepts rotation keys", func(t *testing.T) {
+		config, err := buildServerConfig(WithDTLS13CookieKeys(primary, secondary))
+		require.NoError(t, err)
+		require.Len(t, config.dtls13CookieKeys, 2)
+		assert.Equal(t, primary, config.dtls13CookieKeys[0])
+		assert.Equal(t, secondary, config.dtls13CookieKeys[1])
+	})
+
+	t.Run("rejects empty keys", func(t *testing.T) {
+		require.ErrorIs(t, serverOptionsError(t, WithDTLS13CookieKeys()), dtlscookie.ErrNoKeys)
+	})
+
+	t.Run("rejects short and long keys", func(t *testing.T) {
+		require.ErrorIs(t, serverOptionsError(t, WithDTLS13CookieKeys(make([]byte, 15))), dtlscookie.ErrInvalidKey)
+		require.ErrorIs(t, serverOptionsError(t, WithDTLS13CookieKeys(make([]byte, 65))), dtlscookie.ErrInvalidKey)
+	})
+
+	t.Run("copies key material", func(t *testing.T) {
+		config, err := buildServerConfig(WithDTLS13CookieKeys(primary))
+		require.NoError(t, err)
+		primary[0] ^= 0xff
+		assert.NotEqual(t, primary[0], config.dtls13CookieKeys[0][0])
+	})
+
+	t.Run("is server only", func(t *testing.T) {
+		var option ServerOption = WithDTLS13CookieKeys(primary)
+		assert.NotNil(t, option)
+		_, ok := any(option).(Option)
+		assert.False(t, ok, "cookie keys must not be usable as a client option")
+	})
+}
+
 func TestServerOnlyNilCallbackOptionsReturnError(t *testing.T) {
 	tests := map[string]struct {
 		option ServerOption

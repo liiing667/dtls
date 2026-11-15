@@ -10,6 +10,7 @@ import (
 	"crypto"
 	"errors"
 	"fmt"
+	"net"
 
 	dtlsconfig "github.com/pion/dtls/v4/internal/config"
 	dtlserrors "github.com/pion/dtls/v4/internal/errors"
@@ -24,7 +25,6 @@ import (
 )
 
 const (
-	cookieLength          = 20
 	renegotiationInfoSCSV = 0x00ff
 )
 
@@ -77,6 +77,8 @@ type ParseDependencies struct {
 	Cache  *dtlsflight.Cache
 	Config *dtlsconfig.HandshakeConfig
 	Hooks  ParseHooks
+	// RemoteAddr is the peer transport address used to bind HRR cookies.
+	RemoteAddr net.Addr
 }
 
 type flightParseFailure struct {
@@ -96,6 +98,7 @@ type handshakeContext struct {
 	state                                *dtlsstate.State13
 	cache                                *dtlsflight.Cache
 	cfg                                  *dtlsconfig.HandshakeConfig
+	remoteAddr                           net.Addr
 	inboundHandshakeHandler              InboundHandshakeHandler
 	protectedHandshakeHandler            ProtectedHandshakeHandler
 	handshakeTrafficSecretDeriver        HandshakeTrafficSecretDeriver
@@ -135,6 +138,7 @@ func newHandshakeContext(dependencies ParseDependencies) *handshakeContext {
 		state:                                dependencies.State,
 		cache:                                dependencies.Cache,
 		cfg:                                  dependencies.Config,
+		remoteAddr:                           dependencies.RemoteAddr,
 		inboundHandshakeHandler:              dependencies.Hooks.InboundHandshake,
 		protectedHandshakeHandler:            dependencies.Hooks.ProtectedHandshake,
 		handshakeTrafficSecretDeriver:        dependencies.Hooks.HandshakeTrafficSecretDeriver,
@@ -230,6 +234,7 @@ func adaptFlightGenerator(gen contextFlightGenerator) Generator {
 	) ([]*dtlsflight.Outbound, *alert.Alert, error) {
 		flightCtx := newHandshakeContext(ParseDependencies{State: state, Cache: cache, Config: cfg})
 		flightCtx.finalizeClientHello = finalize
+		flightCtx.remoteAddr = remoteAddr(conn)
 
 		return gen(conn, flightCtx)
 	}
@@ -259,6 +264,9 @@ func Parse(ctx context.Context, f Flight, conn dtlsflight.Conn, dependencies Par
 	parse, ok := getFlightParser(f)
 	if !ok {
 		return 0, nil, nil, false
+	}
+	if dependencies.RemoteAddr == nil {
+		dependencies.RemoteAddr = remoteAddr(conn)
 	}
 
 	nextFlight, dtlsAlert, err := parse(ctx, conn, newHandshakeContext(dependencies))

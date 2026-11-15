@@ -63,6 +63,15 @@ func parseRetryClientHello(flightCtx *handshakeContext, pull dtlsflight.Handshak
 	if err := negotiation.ValidateClientHelloRetry(snapshots.Initial(), snapshots.Current(), flightCtx.state.HelloRetryRequest); err != nil {
 		return 0, &alert.Alert{Level: alert.Fatal, Description: alert.IllegalParameter}, err
 	}
+	if !flightCtx.cfg.InsecureSkipHelloVerify {
+		cookie, present := clientHelloCookie(clientHello)
+		if !present {
+			return 0, &alert.Alert{Level: alert.Fatal, Description: alert.IllegalParameter}, dtlserrors.ErrCookieMismatch
+		}
+		if err := validateStatelessCookie(flightCtx, flightCtx.remoteAddr, cookie); err != nil {
+			return 0, &alert.Alert{Level: alert.Fatal, Description: alert.IllegalParameter}, err
+		}
+	}
 
 	if failure := processClientHelloExtensions(flightCtx.state, clientHello); failure != nil {
 		return 0, failure.alert, failure.err
@@ -82,12 +91,19 @@ func parseRetryClientHello(flightCtx *handshakeContext, pull dtlsflight.Handshak
 }
 
 func flight2Generate(
-	_ dtlsflight.Conn,
+	conn dtlsflight.Conn,
 	flightCtx *handshakeContext,
 ) ([]*dtlsflight.Outbound, *alert.Alert, error) {
 	flightCtx.state.HandshakeSendSequence = 0
 	if flightCtx.state.CipherSuite == nil {
 		return nil, nil, dtlserrors.ErrCipherSuiteUnset
+	}
+	if !flightCtx.cfg.InsecureSkipHelloVerify {
+		cookie, err := generateStatelessCookie(flightCtx, remoteAddr(conn))
+		if err != nil {
+			return nil, &alert.Alert{Level: alert.Fatal, Description: alert.InternalError}, err
+		}
+		flightCtx.state.Cookie = cookie
 	}
 
 	random := handshake.Random{}

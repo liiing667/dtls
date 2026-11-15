@@ -5,6 +5,7 @@ package flight12
 
 import (
 	"context"
+	"net"
 	"testing"
 	"time"
 
@@ -54,6 +55,8 @@ func (f *flight1TestMockFlightConn) HandleQueuedPackets(context.Context) error {
 }
 
 func (f *flight1TestMockFlightConn) SessionKey() []byte { return nil }
+
+func (f *flight1TestMockFlightConn) RemoteAddr() net.Addr { return nil }
 
 type flight1TestMockCipherSuite struct {
 	cryptosuite.Suite

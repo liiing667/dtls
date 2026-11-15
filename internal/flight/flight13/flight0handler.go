@@ -5,7 +5,6 @@ package flight13
 
 import (
 	"context"
-	"crypto/rand"
 	"slices"
 
 	dtlsconfig "github.com/pion/dtls/v4/internal/config"
@@ -134,13 +133,6 @@ func flight0Generate(
 	state := flightCtx.state
 	cfg := flightCtx.cfg
 	state.SetSRTPProtectionProfile(0)
-
-	if !cfg.InsecureSkipHelloVerify {
-		state.Cookie = make([]byte, cookieLength)
-		if _, err := rand.Read(state.Cookie); err != nil {
-			return nil, nil, err
-		}
-	}
 
 	state.SetLocalEpoch(EpochInitial)
 	state.SetRemoteEpoch(EpochInitial)
