@@ -1536,6 +1536,122 @@ func TestFlight13_3ParseRejectsSecondHelloRetryRequest(t *testing.T) {
 	assert.Zero(t, nextFlight)
 }
 
+// helloRetryRequestForClientTest drives the client through a validated HRR so
+// state.HelloRetryRequest binds the follow-up ServerHello to the HRR selection.
+func helloRetryRequestForClientTest(t *testing.T, cfg *dtlsconfig.HandshakeConfig, state *dtlsstate.State13, group elliptic.Curve) {
+	t.Helper()
+
+	extensions := []extension.Value{&extension13.SelectedVersion{Version: protocol.Version1_3}}
+	if group != 0 {
+		extensions = append(extensions, &extension13.RetryKeyShare{SelectedGroup: group})
+	}
+	rawHRR := marshalHelloRetryRequestServerHello(t, cfg, extensions)
+
+	cache := dtlsflight.NewCache()
+	cache.Push(rawHRR, cfg.InitialEpoch, 0, handshake.TypeServerHello, false)
+	nextFlight, dtlsAlert, err := flight13ParseForTest(t, dtlsflight13.Flight1, context.Background(), &handshakeTestContext13{state: state, cache: cache, cfg: cfg})
+	require.NoError(t, err)
+	require.Nil(t, dtlsAlert)
+	require.Equal(t, dtlsflight13.Flight3, nextFlight)
+	require.True(t, state.HelloRetryRequest.HasSelectedGroup)
+}
+
+func finalServerHelloForRetryTest(t *testing.T, cfg *dtlsconfig.HandshakeConfig, cipherSuiteID uint16, group elliptic.Curve) []byte {
+	t.Helper()
+
+	serverKeypair, err := elliptic.GenerateKeypair(group)
+	require.NoError(t, err)
+	random := handshake.Random{RandomBytes: [handshake.RandomBytesLength]byte{0x01, 0x02, 0x03}}
+	serverHello := &handshake.MessageServerHello{
+		Version:           protocol.Version1_2,
+		Random:            random,
+		CipherSuiteID:     &cipherSuiteID,
+		CompressionMethod: dtlsflight.DefaultCompressionMethods()[0],
+		Extensions: []extension.Value{
+			&extension13.SelectedVersion{Version: protocol.Version1_3},
+			&extension13.ServerKeyShare{Share: extension13.KeyShareEntry{Group: group, KeyExchange: serverKeypair.PublicKey}},
+		},
+	}
+	rawServerHello, err := (&handshake.Handshake{Header: handshake.Header{MessageSequence: 1}, Message: serverHello}).Marshal()
+	require.NoError(t, err)
+
+	return rawServerHello
+}
+
+// After a HelloRetryRequest the final ServerHello must not silently downgrade
+// the cipher suite, selected group, or negotiated version pinned by the HRR.
+func TestFlight13_3ParseRejectsDowngradeAfterHelloRetryRequest(t *testing.T) {
+	primarySuite := ciphersuite.ForID(cryptosuite.TLS_AES_128_GCM_SHA256)
+	fallbackSuite := ciphersuite.ForID(cryptosuite.TLS_AES_256_GCM_SHA384)
+	require.NotNil(t, primarySuite)
+	require.NotNil(t, fallbackSuite)
+
+	tests := map[string]struct {
+		buildServerHello func(t *testing.T, cfg *dtlsconfig.HandshakeConfig, group elliptic.Curve) []byte
+		wantError        error
+		wantAlert        alert.Description
+	}{
+		"cipher suite changed after retry": {
+			buildServerHello: func(t *testing.T, cfg *dtlsconfig.HandshakeConfig, group elliptic.Curve) []byte {
+				return finalServerHelloForRetryTest(t, cfg, uint16(fallbackSuite.ID()), group)
+			},
+			wantError: dtlserrors.ErrInvalidServerHello,
+			wantAlert: alert.IllegalParameter,
+		},
+		"selected group changed after retry": {
+			buildServerHello: func(t *testing.T, cfg *dtlsconfig.HandshakeConfig, group elliptic.Curve) []byte {
+				return finalServerHelloForRetryTest(t, cfg, uint16(primarySuite.ID()), elliptic.X25519)
+			},
+			wantError: dtlserrors.ErrServerKeyShareUnknownGroup,
+			wantAlert: alert.IllegalParameter,
+		},
+		"version downgraded to DTLS 1.2 after retry": {
+			buildServerHello: func(t *testing.T, cfg *dtlsconfig.HandshakeConfig, group elliptic.Curve) []byte {
+				raw := finalServerHelloForRetryTest(t, cfg, uint16(primarySuite.ID()), group)
+				parsed := &handshake.Handshake{}
+				require.NoError(t, parsed.Unmarshal(raw))
+				serverHello := parsed.Message.(*handshake.MessageServerHello)
+				serverHello.Extensions = slices.DeleteFunc(serverHello.Extensions, func(value extension.Value) bool {
+					return value.ExtensionType() == extension.TypeSupportedVersions
+				})
+				rewritten, err := (&handshake.Handshake{Header: handshake.Header{MessageSequence: 1}, Message: serverHello}).Marshal()
+				require.NoError(t, err)
+
+				return rewritten
+			},
+			wantError: dtlserrors.ErrUnsupportedProtocolVersion,
+			wantAlert: alert.ProtocolVersion,
+		},
+	}
+
+	for name, test := range tests {
+		t.Run(name, func(t *testing.T) {
+			cfg := testHandshakeConfig13(t)
+			cfg.LocalCipherSuites = []dtlsconfig.CipherSuite{primarySuite, fallbackSuite}
+			cfg.ClientHelloMessageHook = omitInitialKeyShares()
+
+			state := newTestState13(t, false)
+			_, dtlsAlert, err := flight13GenerateForTest(t, dtlsflight13.Flight1, &handshakeTestContext13{state: state, cfg: cfg})
+			require.NoError(t, err)
+			require.Nil(t, dtlsAlert)
+
+			selectedGroup := elliptic.P384
+			helloRetryRequestForClientTest(t, cfg, state, selectedGroup)
+
+			rawServerHello := test.buildServerHello(t, cfg, selectedGroup)
+			cache := dtlsflight.NewCache()
+			cache.Push(rawServerHello, cfg.InitialEpoch, 1, handshake.TypeServerHello, false)
+
+			nextFlight, dtlsAlert, err := flight13ParseForTest(t, dtlsflight13.Flight3, context.Background(), &handshakeTestContext13{state: state, cache: cache, cfg: cfg})
+			require.ErrorIs(t, err, test.wantError)
+			require.NotNil(t, dtlsAlert)
+			assert.Equal(t, alert.Fatal, dtlsAlert.Level)
+			assert.Equal(t, test.wantAlert, dtlsAlert.Description)
+			assert.Zero(t, nextFlight)
+		})
+	}
+}
+
 func TestFlight13_3ParseRejectsWrongLegacyVersion(t *testing.T) {
 	cfg := testHandshakeConfig13(t)
 	state := newTestState13(t, false)
