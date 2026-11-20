@@ -43,7 +43,6 @@ import (
 	"github.com/pion/logging"
 	"github.com/pion/transport/v5/deadline"
 	"github.com/pion/transport/v5/netctx"
-	"github.com/pion/transport/v5/replaydetector"
 )
 
 const (
@@ -2348,6 +2347,9 @@ func (c *Conn) openUnmaskedCiphertext(record recordlayer.ParsedRecord, generatio
 		return openedRecord{}, 0, operationalProtectionError(lengthErr)
 	}
 
+	// Authenticated records establish the sequence reference used to
+	// reconstruct later sequence numbers, even when their content is
+	// discarded. The replay window itself is only consumed on commit.
 	common.UpdateRemoteSequenceNumber(generation.Epoch, sequenceNumber)
 
 	return c.parseUnifiedInnerPlaintext(plaintext, generation.Epoch, sequenceNumber)
@@ -2500,33 +2502,19 @@ func (c *Conn) replayMarker(epoch, sequenceNumber, maximum uint64) (func() bool,
 	if common.LocalVersion == 0 && epoch == 0 {
 		return func() bool { return false }, true
 	}
-	if common.ReplayDetector == nil {
-		common.ReplayDetector = make(map[uint64]replaydetector.ReplayDetector)
-	}
-	if common.ReplayDetector[epoch] == nil {
-		common.ReplayDetector[epoch] = replaydetector.New(c.replayProtectionWindow, maximum)
-	}
-	accept, ok := common.ReplayDetector[epoch].Check(sequenceNumber)
+	// DTLS 1.2 protected epochs are never gated: their retransmissions remain
+	// valid after later epochs start. Every other record only counts as the
+	// latest while its epoch is the highest received.
+	_, isState12 := c.state.(*dtlsstate.State12)
+	gateEpoch := !isState12 || epoch == 0
+	commit, ok := common.CheckReplaySequence(epoch, sequenceNumber, c.replayProtectionWindow, maximum, epoch != 0, gateEpoch)
 	if !ok {
 		c.log.Debugf("discarded duplicated packet (epoch: %d, seq: %d)", epoch, sequenceNumber)
 
 		return nil, false
 	}
 
-	if _, ok := c.state.(*dtlsstate.State12); ok && epoch != 0 {
-		return func() bool {
-			latest := accept()
-			common.UpdateRemoteSequenceNumber(epoch, sequenceNumber)
-
-			return latest
-		}, true
-	}
-
-	return func() bool {
-		latest := accept()
-
-		return latest && epoch >= common.HighestRemoteEpoch()
-	}, true
+	return commit, true
 }
 
 func (c *Conn) pruneReplayEpochs() {
@@ -2534,15 +2522,7 @@ func (c *Conn) pruneReplayEpochs() {
 	if !ok || state.TrafficKeys == nil {
 		return
 	}
-	state.RetainTrafficCounters(state.TrafficKeys)
-	for epoch := range state.ReplayDetector {
-		if epoch == 0 {
-			continue
-		}
-		if _, retained := state.TrafficKeys.Read(epoch); !retained {
-			delete(state.ReplayDetector, epoch)
-		}
-	}
+	state.PruneReplayState(state.TrafficKeys)
 }
 
 func (c *Conn) passesReplayCutoff(epoch, sequenceNumber uint64) bool {

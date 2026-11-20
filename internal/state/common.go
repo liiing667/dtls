@@ -23,7 +23,10 @@ import (
 
 // Common is the protocol-independent connection state shared by DTLS versions.
 type Common struct {
-	localEpoch, remoteEpoch   atomic.Uint64
+	localEpoch, remoteEpoch atomic.Uint64
+	// sequenceMu guards the local and remote sequence counters, the highest
+	// received epoch, and the replay windows: a record's identity and the
+	// window state are always committed inside one critical section.
 	sequenceMu                sync.Mutex
 	LocalSequenceNumber       map[uint64]uint64
 	RemoteSequenceNumber      map[uint64]uint64
@@ -144,6 +147,10 @@ func (s *Common) SetLocalSequenceNumber(epoch, sequenceNumber uint64) {
 func (s *Common) RetainTrafficCounters(keys *TrafficKeyState) {
 	s.sequenceMu.Lock()
 	defer s.sequenceMu.Unlock()
+	s.retainTrafficCountersLocked(keys)
+}
+
+func (s *Common) retainTrafficCountersLocked(keys *TrafficKeyState) {
 	for epoch := range s.LocalSequenceNumber {
 		if epoch == 0 {
 			continue
@@ -163,6 +170,62 @@ func (s *Common) RetainTrafficCounters(keys *TrafficKeyState) {
 	}
 }
 
+// PruneReplayState drops replay windows and traffic counters for epochs whose
+// keys are no longer retained. Epoch zero is kept: it carries the plaintext
+// handshake and has no traffic keys.
+func (s *Common) PruneReplayState(keys *TrafficKeyState) {
+	s.sequenceMu.Lock()
+	defer s.sequenceMu.Unlock()
+	s.retainTrafficCountersLocked(keys)
+	for epoch := range s.ReplayDetector {
+		if epoch == 0 {
+			continue
+		}
+		if _, retained := keys.Read(epoch); !retained {
+			delete(s.ReplayDetector, epoch)
+		}
+	}
+}
+
+// CheckReplaySequence verifies a record against the replay window of its
+// epoch. When the record passes, the returned closure atomically commits the
+// record identity to the replay state: it marks the sequence number in the
+// window and, when updateSequence is set, records it as received. The commit
+// reports whether the record is the latest; when gateEpoch is set, the record
+// must also belong to the highest received epoch. The check itself does not
+// mutate the window, so records discarded before the commit (for example
+// after a decryption or decode failure) do not consume sequence numbers.
+func (s *Common) CheckReplaySequence(
+	epoch, sequenceNumber uint64, windowSize uint, maxSeq uint64, updateSequence, gateEpoch bool,
+) (commit func() bool, ok bool) {
+	s.sequenceMu.Lock()
+	if s.ReplayDetector == nil {
+		s.ReplayDetector = make(map[uint64]replaydetector.ReplayDetector)
+	}
+	detector := s.ReplayDetector[epoch]
+	if detector == nil {
+		detector = replaydetector.New(windowSize, maxSeq)
+		s.ReplayDetector[epoch] = detector
+	}
+	accept, ok := detector.Check(sequenceNumber)
+	s.sequenceMu.Unlock()
+	if !ok {
+		return nil, false
+	}
+
+	return func() bool {
+		s.sequenceMu.Lock()
+		defer s.sequenceMu.Unlock()
+		latest := accept()
+		current := !gateEpoch || epoch >= s.highestRemoteEpoch
+		if updateSequence {
+			s.updateRemoteSequenceNumberLocked(epoch, sequenceNumber)
+		}
+
+		return latest && current
+	}, true
+}
+
 // HighestRemoteSequenceNumber distinguishes an unseen epoch from one that received record zero.
 func (s *Common) HighestRemoteSequenceNumber(epoch uint64) (uint64, bool) {
 	s.sequenceMu.Lock()
@@ -177,7 +240,10 @@ func (s *Common) HighestRemoteSequenceNumber(epoch uint64) (uint64, bool) {
 func (s *Common) UpdateRemoteSequenceNumber(epoch, sequenceNumber uint64) {
 	s.sequenceMu.Lock()
 	defer s.sequenceMu.Unlock()
+	s.updateRemoteSequenceNumberLocked(epoch, sequenceNumber)
+}
 
+func (s *Common) updateRemoteSequenceNumberLocked(epoch, sequenceNumber uint64) {
 	if s.RemoteSequenceNumber == nil {
 		s.RemoteSequenceNumber = make(map[uint64]uint64)
 	}
