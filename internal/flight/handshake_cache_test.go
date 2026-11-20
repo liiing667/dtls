@@ -547,3 +547,54 @@ func TestHandshakeCacheSessionHash(t *testing.T) {
 		assert.Equal(t, test.Expected, verifyData, "handshakeCacheSessionHash")
 	}
 }
+
+func TestHandshakeCacheBounded12RejectsChangedRetransmission(t *testing.T) {
+	const (
+		epoch    uint64 = 0
+		sequence uint16 = 3
+	)
+	original := []byte{0x01, 0x02, 0x03}
+
+	t.Run("identical retransmission is deduplicated", func(t *testing.T) {
+		cache := dtlsflight.NewCache()
+		require.NoError(t, cache.PushBounded12(original, epoch, sequence, handshake.TypeCertificate, true))
+		require.NoError(t, cache.PushBounded12(append([]byte{}, original...), epoch, sequence, handshake.TypeCertificate, true))
+
+		item, ok := cache.PullExact(sequence, true)
+		require.True(t, ok)
+		assert.Equal(t, original, item.Data)
+	})
+
+	t.Run("changed payload is rejected", func(t *testing.T) {
+		cache := dtlsflight.NewCache()
+		require.NoError(t, cache.PushBounded12(original, epoch, sequence, handshake.TypeCertificate, true))
+		changed := append([]byte{}, original...)
+		changed[len(changed)-1] ^= 0xff
+		err := cache.PushBounded12(changed, epoch, sequence, handshake.TypeCertificate, true)
+		assert.ErrorIs(t, err, dtlserrors.ErrHandshakeMessageChanged)
+
+		item, ok := cache.PullExact(sequence, true)
+		require.True(t, ok)
+		assert.Equal(t, original, item.Data, "the altered retransmission must not replace the transcript message")
+	})
+
+	t.Run("changed handshake type is rejected", func(t *testing.T) {
+		cache := dtlsflight.NewCache()
+		require.NoError(t, cache.PushBounded12(original, epoch, sequence, handshake.TypeCertificate, true))
+		err := cache.PushBounded12(original, epoch, sequence, handshake.TypeCertificateVerify, true)
+		assert.ErrorIs(t, err, dtlserrors.ErrHandshakeMessageChanged)
+	})
+
+	t.Run("same sequence from the other sender is independent", func(t *testing.T) {
+		cache := dtlsflight.NewCache()
+		require.NoError(t, cache.PushBounded12(original, epoch, sequence, handshake.TypeCertificate, true))
+		assert.NoError(t, cache.PushBounded12([]byte{0x09}, epoch, sequence, handshake.TypeCertificate, false))
+	})
+
+	t.Run("frozen cache keeps accepting final-flight duplicates", func(t *testing.T) {
+		cache := dtlsflight.NewCache()
+		require.NoError(t, cache.PushBounded12(original, epoch, sequence, handshake.TypeFinished, true))
+		cache.Finish12()
+		assert.NoError(t, cache.PushBounded12(original, epoch, sequence, handshake.TypeFinished, true))
+	})
+}

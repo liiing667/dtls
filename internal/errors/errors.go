@@ -265,6 +265,7 @@ var (
 		"HelloRetryRequest requires supported_versions",
 	)
 	ErrUnexpectedHandshakeMessage          = stderrors.New("unexpected handshake message")
+	ErrHandshakeMessageChanged             = stderrors.New("handshake message changed during retransmission")
 	ErrMissingSignatureAlgorithmsExtension = stderrors.New("signature_algorithms extension is required in CertificateRequest")
 	ErrInvalidKeyUpdate                    = stderrors.New("invalid KeyUpdate request")
 	ErrInvalidConnectionIDUsage            = stderrors.New("invalid connection ID usage")

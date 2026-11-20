@@ -2810,8 +2810,13 @@ func (c *Conn) bufferHandshakeRecord(content []byte, number protocol.RecordNumbe
 	c.syncFragmentBufferHandshakeSequence()
 	result, err := c.fragmentBuffer.Push(number.Epoch, content)
 	if err != nil {
-		// Decode error must be silently discarded
-		// [RFC6347 Section-4.1.2.7]
+		// Structural decode errors and resource exhaustion are silently
+		// discarded [RFC6347 Section-4.1.2.7]. A fragment that contradicts a
+		// message already accepted for its message_seq is a protocol violation:
+		// reject it before any altered content can enter the transcript.
+		if errors.Is(err, dtlserrors.ErrInvalidPacket) {
+			return packetOutcome{responseAlert: &alert.Alert{Level: alert.Fatal, Description: alert.UnexpectedMessage}}, false, err
+		}
 		c.log.Debugf("defragment failed: %s", err)
 
 		return packetOutcome{}, false, nil

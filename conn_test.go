@@ -858,6 +858,91 @@ func (*queuedPacketListener) Close() error { return nil }
 
 func (*queuedPacketListener) Addr() net.Addr { return nil }
 
+func TestDTLS12ChangedRetransmissionRejected(t *testing.T) {
+	newTestConn12 := func() *Conn {
+		state := dtlsstate.NewState12(true)
+		conn := &Conn{
+			fragmentBuffer:         dtlsfragmentbuffer.New(),
+			handshakeCache:         dtlsflight.NewCache(),
+			log:                    logging.NewDefaultLoggerFactory().NewLogger("dtls"),
+			replayProtectionWindow: defaultReplayProtectionWindow,
+			state:                  &state,
+		}
+		conn.setRemoteEpoch(0)
+
+		return conn
+	}
+	handshakeRecord := func(t *testing.T, recordSequence uint64, header handshake.Header, payload []byte) []byte {
+		t.Helper()
+		rawHeader, err := header.Marshal()
+		require.NoError(t, err)
+		record, err := recordlayer.MarshalRecord(recordlayer.RecordConfig{
+			ContentType: protocol.ContentTypeHandshake, Version: protocol.Version1_2, Epoch: 0, SequenceNumber: recordSequence,
+		}, append(rawHeader, payload...))
+		require.NoError(t, err)
+
+		return record
+	}
+	certificateHeader := func(messageSequence uint16, offset, length uint32) handshake.Header {
+		return handshake.Header{
+			Type: handshake.TypeCertificate, MessageSequence: messageSequence,
+			Length: 4, FragmentOffset: offset, FragmentLength: length,
+		}
+	}
+
+	t.Run("legal retransmission is accepted and deduplicated", func(t *testing.T) {
+		conn := newTestConn12()
+		payload := []byte{1, 2, 3, 4}
+		_, err := conn.handleIncomingPacket(t.Context(), handshakeRecord(t, 0, certificateHeader(0, 0, 4), payload), nil, nil, false)
+		require.NoError(t, err)
+		outcome, err := conn.handleIncomingPacket(t.Context(), handshakeRecord(t, 1, certificateHeader(0, 0, 4), payload), nil, nil, false)
+		require.NoError(t, err)
+		assert.True(t, outcome.containsHandshake)
+		assert.True(t, outcome.retransmit)
+
+		item, ok := conn.handshakeCache.PullExact(0, false)
+		require.True(t, ok)
+		assert.Equal(t, payload, item.Data[handshake.HeaderLength:])
+	})
+
+	t.Run("changed retransmission raises unexpected_message", func(t *testing.T) {
+		conn := newTestConn12()
+		payload := []byte{1, 2, 3, 4}
+		_, err := conn.handleIncomingPacket(t.Context(), handshakeRecord(t, 0, certificateHeader(0, 0, 4), payload), nil, nil, false)
+		require.NoError(t, err)
+
+		changed := append([]byte{}, payload...)
+		changed[2] ^= 0xff
+		outcome, err := conn.handleIncomingPacket(t.Context(), handshakeRecord(t, 1, certificateHeader(0, 0, 4), changed), nil, nil, false)
+		assert.ErrorIs(t, err, dtlserrors.ErrInvalidPacket)
+		if assert.NotNil(t, outcome.responseAlert) {
+			assert.Equal(t, alert.Fatal, outcome.responseAlert.Level)
+			assert.Equal(t, alert.UnexpectedMessage, outcome.responseAlert.Description)
+		}
+
+		item, ok := conn.handshakeCache.PullExact(0, false)
+		require.True(t, ok)
+		assert.Equal(t, payload, item.Data[handshake.HeaderLength:])
+	})
+
+	t.Run("retransmitted fragment with new boundaries is accepted", func(t *testing.T) {
+		conn := newTestConn12()
+		payload := []byte{1, 2, 3, 4}
+		_, err := conn.handleIncomingPacket(t.Context(), handshakeRecord(t, 0, certificateHeader(0, 0, 2), payload[:2]), nil, nil, false)
+		require.NoError(t, err)
+		_, err = conn.handleIncomingPacket(t.Context(), handshakeRecord(t, 1, certificateHeader(0, 2, 2), payload[2:]), nil, nil, false)
+		require.NoError(t, err)
+
+		item, ok := conn.handshakeCache.PullExact(0, false)
+		require.True(t, ok)
+		assert.Equal(t, payload, item.Data[handshake.HeaderLength:])
+
+		outcome, err := conn.handleIncomingPacket(t.Context(), handshakeRecord(t, 2, certificateHeader(0, 1, 3), payload[1:]), nil, nil, false)
+		require.NoError(t, err)
+		assert.True(t, outcome.retransmit)
+	})
+}
+
 func TestFragmentBuffer_Retransmission(t *testing.T) {
 	fragmentBuffer := dtlsfragmentbuffer.New()
 	frag := []byte{0x16, 0xfe, 0xfd, 0x00, 0x00, 0x00, 0x00, 0x00, 0x00, 0x00, 0x01, 0x00, 0x30, 0x03, 0x00, 0x00, 0x04, 0x00, 0x00, 0x00, 0x00, 0x00, 0x00, 0x00, 0x04, 0xfe, 0xff, 0x01, 0x01}

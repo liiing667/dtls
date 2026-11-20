@@ -396,6 +396,119 @@ func TestFragmentBuffer_RetransmitDetection(t *testing.T) {
 	}
 }
 
+func marshalHandshakeFragment(t *testing.T, header handshake.Header, payload []byte) []byte {
+	t.Helper()
+	require.Equal(t, int(header.FragmentLength), len(payload))
+	rawHeader, err := header.Marshal()
+	require.NoError(t, err)
+
+	return append(rawHeader, payload...)
+}
+
+// TestFragmentBufferCanonicalRetransmission covers the four same-sequence
+// cases: legal retransmission (also with new fragmentation), changed message
+// retransmission, old sequence handling, and exact duplicates.
+func TestFragmentBufferCanonicalRetransmission(t *testing.T) {
+	const sequence uint16 = 0
+	header := func(offset, length uint32) handshake.Header {
+		return handshake.Header{
+			Type: handshake.TypeCertificate, MessageSequence: sequence,
+			Length: 6, FragmentOffset: offset, FragmentLength: length,
+		}
+	}
+	original := []byte{0, 1, 2, 3, 4, 5}
+
+	assemble := func(t *testing.T, buffer *FragmentBuffer) {
+		t.Helper()
+		first := marshalHandshakeFragment(t, header(0, 3), original[0:3])
+		second := marshalHandshakeFragment(t, header(3, 3), original[3:6])
+		_, err := buffer.Push(0, first)
+		require.NoError(t, err)
+		_, err = buffer.Push(0, second)
+		require.NoError(t, err)
+		content, epoch := buffer.Pop()
+		require.NotNil(t, content)
+		assert.Equal(t, uint64(0), epoch)
+	}
+
+	t.Run("exact duplicate remains a retransmission", func(t *testing.T) {
+		buffer := New()
+		assemble(t, buffer)
+
+		result, err := buffer.Push(0, marshalHandshakeFragment(t, header(0, 3), original[0:3]))
+		require.NoError(t, err)
+		assert.True(t, result.IsRetransmit)
+		assert.True(t, result.IsRetransmitStart)
+		assert.Zero(t, buffer.totalFragmentCount)
+	})
+
+	t.Run("legal retransmission with new fragmentation", func(t *testing.T) {
+		buffer := New()
+		assemble(t, buffer)
+
+		retransmit := marshalHandshakeFragment(t, header(2, 4), original[2:6])
+		result, err := buffer.Push(0, retransmit)
+		require.NoError(t, err)
+		assert.True(t, result.IsRetransmit)
+		assert.Zero(t, buffer.totalFragmentCount)
+	})
+
+	t.Run("changed payload is rejected", func(t *testing.T) {
+		buffer := New()
+		assemble(t, buffer)
+
+		changed := append([]byte{}, original...)
+		changed[2] ^= 0xff
+		_, err := buffer.Push(0, marshalHandshakeFragment(t, header(2, 4), changed[2:6]))
+		assert.ErrorIs(t, err, dtlserrors.ErrInvalidPacket)
+	})
+
+	t.Run("changed metadata is rejected", func(t *testing.T) {
+		buffer := New()
+		assemble(t, buffer)
+
+		wrongType := header(0, 3)
+		wrongType.Type = handshake.TypeFinished
+		_, err := buffer.Push(0, marshalHandshakeFragment(t, wrongType, original[0:3]))
+		assert.ErrorIs(t, err, dtlserrors.ErrInvalidPacket)
+
+		wrongEpoch, err := buffer.Push(1, marshalHandshakeFragment(t, header(0, 3), original[0:3]))
+		require.ErrorIs(t, err, dtlserrors.ErrInvalidPacket)
+		assert.Equal(t, PushResult{}, wrongEpoch)
+	})
+
+	t.Run("old sequence stays cacheable after AdvanceTo", func(t *testing.T) {
+		buffer := New()
+		assemble(t, buffer)
+		buffer.AdvanceTo(1)
+
+		result, err := buffer.Push(0, marshalHandshakeFragment(t, header(0, 3), original[0:3]))
+		require.NoError(t, err)
+		assert.True(t, result.IsRetransmit)
+
+		changed := append([]byte{}, original...)
+		changed[0] ^= 0xff
+		_, err = buffer.Push(0, marshalHandshakeFragment(t, header(0, 3), changed[0:3]))
+		assert.ErrorIs(t, err, dtlserrors.ErrInvalidPacket)
+	})
+}
+
+func TestFragmentBufferCanonicalEviction(t *testing.T) {
+	buffer := New()
+	for sequence := range uint16(canonicalMessageLimit + 5) {
+		h := handshake.Header{
+			Type: handshake.TypeFinished, MessageSequence: sequence,
+			Length: 1, FragmentLength: 1,
+		}
+		_, err := buffer.Push(0, marshalHandshakeFragment(t, h, []byte{0x01}))
+		require.NoError(t, err)
+		content, _ := buffer.Pop()
+		require.NotNil(t, content)
+	}
+
+	assert.Len(t, buffer.canonical, canonicalMessageLimit)
+}
+
 func marshalHandshakeContent(t *testing.T, headers ...handshake.Header) []byte {
 	t.Helper()
 

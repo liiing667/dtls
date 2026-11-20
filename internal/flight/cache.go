@@ -582,9 +582,17 @@ func (h *Cache) PushBounded12(data []byte, epoch uint64, sequence uint16, typ ha
 		return nil
 	}
 	for _, item := range h.cache {
-		if item.Epoch == epoch && item.MessageSequence == sequence && item.IsClient == isClient && item.Typ == typ {
-			return nil
+		if item.Epoch != epoch || item.MessageSequence != sequence || item.IsClient != isClient {
+			continue
 		}
+		// RFC 6347 Section 4.1.1.1: retransmissions of the same message_seq
+		// must reproduce the exact message. A changed payload or handshake
+		// type is a protocol violation, not a benign duplicate.
+		if item.Typ != typ || !bytes.Equal(item.Data, data) {
+			return fmt.Errorf("%w: %w", dtlserrors.ErrHandshakeMessageChanged, &alert.Alert{Level: alert.Fatal, Description: alert.UnexpectedMessage})
+		}
+
+		return nil
 	}
 	const maxBytes = 8_000_000
 	const maxMessages = 1000

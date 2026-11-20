@@ -17,6 +17,9 @@ const (
 	// 2 megabytes.
 	fragmentBufferMaxSize  = 2000000
 	fragmentBufferMaxCount = 1000
+	// canonicalMessageLimit bounds retained reassembled messages independently
+	// of how often each one is retransmitted.
+	canonicalMessageLimit = 1000
 )
 
 type fragment struct {
@@ -43,10 +46,24 @@ type fragments struct {
 	epoch            uint64
 }
 
+// canonicalMessage is the single verified, reassembled message accepted for
+// a message sequence. Retransmissions must reproduce it byte for byte even
+// when their fragmentation differs.
+type canonicalMessage struct {
+	epoch uint64
+	typ   handshake.Type
+	data  []byte
+}
+
 // FragmentBuffer stores and reassembles fragmented DTLS handshake messages.
 type FragmentBuffer struct {
 	// map of MessageSequenceNumbers that hold slices of fragments
 	cache map[uint16]*fragments
+
+	// canonical retains the reassembled message of every completed sequence.
+	// It keeps retransmission validation independent of the reassembly cache,
+	// which drops a sequence as soon as the message is popped.
+	canonical map[uint16]canonicalMessage
 
 	currentMessageSequenceNumber uint16
 	sequenceExhausted            bool
@@ -57,7 +74,7 @@ type FragmentBuffer struct {
 
 // New creates an empty FragmentBuffer.
 func New() *FragmentBuffer {
-	return &FragmentBuffer{cache: map[uint16]*fragments{}}
+	return &FragmentBuffer{cache: map[uint16]*fragments{}, canonical: map[uint16]canonicalMessage{}}
 }
 
 // current total size of buffer.
@@ -78,6 +95,11 @@ func (f *FragmentBuffer) AdvanceTo(messageSequence uint16) {
 		f.totalBufferSize -= int(cachedFragments.fragmentsLength)
 		f.totalFragmentCount -= len(cachedFragments.fragmentByOffset)
 		delete(f.cache, cachedSequence)
+	}
+	for canonicalSequence := range f.canonical {
+		if canonicalSequence < messageSequence {
+			delete(f.canonical, canonicalSequence)
+		}
 	}
 
 	f.currentMessageSequenceNumber = messageSequence
@@ -146,6 +168,9 @@ func (f *FragmentBuffer) validateFragments(epoch uint64, parsed []parsedFragment
 		if err := validateFragmentBounds(candidate.header); err != nil {
 			return err
 		}
+		if err := f.validateCanonicalFragment(epoch, candidate); err != nil {
+			return err
+		}
 		if err := f.validateCachedFragment(epoch, candidate); err != nil {
 			return err
 		}
@@ -159,6 +184,29 @@ func (f *FragmentBuffer) validateFragments(epoch uint64, parsed []parsedFragment
 		if err := validateFragmentPair(previous.header, previous.data, candidate.header, candidate.data); err != nil {
 			return err
 		}
+	}
+
+	return nil
+}
+
+// validateCanonicalFragment enforces the single-message rule of RFC 6347
+// Section 4.1.1.1: a retransmitted record must carry the same handshake
+// message with the same message_seq, regardless of how it is fragmented.
+// Legal retransmissions with new fragmentation boundaries are accepted; a
+// changed message body or mismatched metadata is rejected.
+func (f *FragmentBuffer) validateCanonicalFragment(epoch uint64, candidate parsedFragment) error {
+	canonical, ok := f.canonical[candidate.header.MessageSequence]
+	if !ok {
+		return nil
+	}
+	if canonical.epoch != epoch || canonical.typ != candidate.header.Type ||
+		candidate.header.Length != uint32(len(canonical.data)) {
+		return dtlserrors.ErrInvalidPacket
+	}
+	end := candidate.header.FragmentOffset + candidate.header.FragmentLength
+	if end > uint32(len(canonical.data)) ||
+		!bytes.Equal(canonical.data[candidate.header.FragmentOffset:end], candidate.data) {
+		return dtlserrors.ErrInvalidPacket
 	}
 
 	return nil
@@ -218,7 +266,7 @@ func (f *FragmentBuffer) prospectiveResourceUsage(parsed []parsedFragment) (resu
 	newFragments := map[fragmentKey]struct{}{}
 	for _, candidate := range parsed {
 		header := candidate.header
-		if f.sequenceExhausted || header.MessageSequence < f.currentMessageSequenceNumber {
+		if f.sequenceExhausted || header.MessageSequence < f.currentMessageSequenceNumber || f.isCanonicalRetransmit(header.MessageSequence) {
 			result.IsRetransmit = true
 			result.IsRetransmitStart = result.IsRetransmitStart || header.FragmentOffset == 0
 
@@ -245,11 +293,17 @@ func (f *FragmentBuffer) prospectiveResourceUsage(parsed []parsedFragment) (resu
 	return result, newFragmentCount, newBufferSize
 }
 
+func (f *FragmentBuffer) isCanonicalRetransmit(sequence uint16) bool {
+	_, ok := f.canonical[sequence]
+
+	return ok
+}
+
 func (f *FragmentBuffer) commitFragments(epoch uint64, parsed []parsedFragment) {
 	added := map[uint16][]uint32{}
 	for _, candidate := range parsed {
 		header := candidate.header
-		if f.sequenceExhausted || header.MessageSequence < f.currentMessageSequenceNumber {
+		if f.sequenceExhausted || header.MessageSequence < f.currentMessageSequenceNumber || f.isCanonicalRetransmit(header.MessageSequence) {
 			continue
 		}
 
@@ -328,7 +382,8 @@ func (f *FragmentBuffer) Pop() (content []byte, epoch uint64) {
 	f.totalBufferSize -= int(frags.fragmentsLength)
 	f.totalFragmentCount -= len(frags.fragmentByOffset)
 
-	delete(f.cache, f.currentMessageSequenceNumber)
+	sequence := f.currentMessageSequenceNumber
+	delete(f.cache, sequence)
 	// Deliver the final sequence once, then treat all further input as old.
 	// Wrapping would let new content reuse an authenticated message sequence.
 	if f.currentMessageSequenceNumber == math.MaxUint16 {
@@ -336,6 +391,34 @@ func (f *FragmentBuffer) Pop() (content []byte, epoch uint64) {
 	} else {
 		f.currentMessageSequenceNumber++
 	}
+	// Retain the canonical message so a retransmit is validated against the
+	// exact bytes that entered the handshake transcript.
+	if !f.sequenceExhausted {
+		f.evictCanonical()
+		f.canonical[sequence] = canonicalMessage{
+			epoch: messageEpoch,
+			typ:   firstHeader.Type,
+			data:  bytes.Clone(rawMessage),
+		}
+	}
 
 	return append(rawHeader, rawMessage...), messageEpoch
+}
+
+// evictCanonical keeps the canonical message table bounded. Sequences are
+// produced in ascending order, so the smallest retained sequence is the one
+// least likely to be retransmitted next.
+func (f *FragmentBuffer) evictCanonical() {
+	if len(f.canonical) < canonicalMessageLimit {
+		return
+	}
+	var oldest uint16
+	first := true
+	for sequence := range f.canonical {
+		if first || sequence < oldest {
+			oldest = sequence
+			first = false
+		}
+	}
+	delete(f.canonical, oldest)
 }
