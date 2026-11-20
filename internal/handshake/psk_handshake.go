@@ -261,6 +261,9 @@ func (c *handshakeContext) canRetryForCertificate() bool {
 }
 
 func (c *handshakeContext) verifyOfferedPSK(hello *handshake.MessageClientHello, raw []byte, offer *extension13.OfferedPSKs, dhe bool) error {
+	if err := validatePSKOffer(offer); err != nil {
+		return pskHandshakeError(alert.IllegalParameter, err)
+	}
 	i, psk, err := c.selectOfferedPSK(hello, offer, dhe)
 	if err != nil {
 		return pskHandshakeError(alert.HandshakeFailure, err)
@@ -272,9 +275,15 @@ func (c *handshakeContext) verifyOfferedPSK(hello *handshake.MessageClientHello,
 		return pskHandshakeError(alert.HandshakeFailure, dtlserrors.ErrPSKIdentity)
 	}
 	secret, hashID := psk.Secret, psk.Hash
+	if hashID != crypto.SHA256 && hashID != crypto.SHA384 || !hashID.Available() {
+		return pskHandshakeError(alert.IllegalParameter, dtlserrors.ErrPSKHash)
+	}
+	if len(offer.Binders[i]) != hashID.Size() {
+		return pskHandshakeError(alert.IllegalParameter, dtlserrors.ErrPreSharedKeyFormat)
+	}
 	suite := c.pskCipherSuite(hello, hashID)
 	if suite == nil {
-		return c.pskFallback()
+		return pskHandshakeError(alert.HandshakeFailure, dtlserrors.ErrNoAvailablePSKCipherSuite)
 	}
 	prefix, err := ClientHelloBinderPrefix(raw)
 	if err != nil {
@@ -289,6 +298,30 @@ func (c *handshakeContext) verifyOfferedPSK(hello *handshake.MessageClientHello,
 	}
 
 	return c.installSelectedPSK(hello, raw, offer, dhe, i, psk, suite, secret, hashID)
+}
+
+// validatePSKOffer rejects ambiguous offers before a PSK is selected. Each
+// identity must be unique so the selected index always names exactly one
+// offer, and every binder length has to be a supported transcript hash size.
+//
+// https://www.rfc-editor.org/rfc/rfc8446.html#section-4.2.11
+func validatePSKOffer(offer *extension13.OfferedPSKs) error {
+	if offer == nil || len(offer.Identities) == 0 || len(offer.Identities) != len(offer.Binders) {
+		return dtlserrors.ErrPreSharedKeyFormat
+	}
+	seen := make(map[string]struct{}, len(offer.Identities))
+	for i, identity := range offer.Identities {
+		key := string(identity.Identity)
+		if _, ok := seen[key]; ok {
+			return dtlserrors.ErrPSKIdentity
+		}
+		seen[key] = struct{}{}
+		if len(offer.Binders[i]) != crypto.SHA256.Size() && len(offer.Binders[i]) != crypto.SHA384.Size() {
+			return dtlserrors.ErrPSKHash
+		}
+	}
+
+	return nil
 }
 
 func (c *handshakeContext) installSelectedPSK(hello *handshake.MessageClientHello, raw []byte, offer *extension13.OfferedPSKs, dhe bool, i int, psk *dtlsstate.PSK, suite dtlsconfig.CipherSuite, secret []byte, hashID crypto.Hash) error {

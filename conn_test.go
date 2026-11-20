@@ -350,6 +350,69 @@ func TestECDHEPSKHandshake(t *testing.T) {
 	}
 }
 
+func TestPSK13MultiIdentityHandshake(t *testing.T) {
+	offered := []PSK{
+		{Identity: []byte("first"), Key: []byte("key-first")},
+		{Identity: []byte("second"), Key: []byte("key-second")},
+	}
+	for _, test := range []struct {
+		name        string
+		selected    []byte
+		duplicate   bool
+		wantFailure bool
+	}{
+		{name: "select first", selected: []byte("first")},
+		{name: "select second", selected: []byte("second")},
+		{name: "duplicate identity rejected", selected: []byte("second"), duplicate: true, wantFailure: true},
+	} {
+		t.Run(test.name, func(t *testing.T) {
+			clientPSKs := offered
+			if test.duplicate {
+				clientPSKs = []PSK{offered[0], offered[0]}
+			}
+			client, server := handshakePair(t, []ClientOption{
+				WithMinVersion(protocol.Version1_3),
+				WithPSK(func() ([]PSK, error) {
+					psks := make([]PSK, len(clientPSKs))
+					copy(psks, clientPSKs)
+
+					return psks, nil
+				}, nil),
+			}, []ServerOption{
+				WithMinVersion(protocol.Version1_3),
+				WithPSK(nil, func(identities [][]byte) (*PSK, error) {
+					for _, identity := range identities {
+						if bytes.Equal(identity, test.selected) {
+							for _, psk := range offered {
+								if bytes.Equal(psk.Identity, test.selected) {
+									selected := psk
+
+									return &selected, nil
+								}
+							}
+						}
+					}
+
+					return nil, nil
+				}),
+			})
+			if test.wantFailure {
+				require.Error(t, client.handshakeError)
+				require.Error(t, server.handshakeError)
+
+				return
+			}
+			require.NoError(t, client.configErr)
+			require.NoError(t, client.handshakeError)
+			require.NoError(t, server.configErr)
+			require.NoError(t, server.handshakeError)
+			serverState, ok := server.conn.ConnectionState()
+			require.True(t, ok)
+			require.Equal(t, test.selected, serverState.IdentityHint)
+		})
+	}
+}
+
 func TestExportKeyingMaterial(t *testing.T) {
 	const exportLabel = "EXTRACTOR-dtls_srtp"
 
