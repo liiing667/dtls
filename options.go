@@ -597,15 +597,17 @@ func (o serverOnlyOption) applyServer(c *dtlsConfig) error { return o(c) }
 
 // WithClientAuth sets the client authentication policy.
 // Returns an error if the type is invalid.
-// This option is only applicable to servers.
-func WithClientAuth(auth ClientAuthType) ServerOption {
-	return serverOnlyOption(valueOption(func(c *dtlsConfig) *ClientAuthType { return &c.ClientAuth }, auth, optionError(auth < NoClientCert || auth > RequireAndVerifyClientCert, dtlserrors.ErrInvalidClientAuthType)))
+// Only servers consult the policy; clients accept it so that Resume can
+// re-apply the current policy to restored server connections.
+func WithClientAuth(auth ClientAuthType) Option {
+	return valueOption(func(c *dtlsConfig) *ClientAuthType { return &c.ClientAuth }, auth, optionError(auth < NoClientCert || auth > RequireAndVerifyClientCert, dtlserrors.ErrInvalidClientAuthType))
 }
 
 // WithClientCAs sets the client certificate authorities.
-// This option is only applicable to servers.
-func WithClientCAs(pool *x509.CertPool) ServerOption {
-	return serverOnlyOption(valueOption(func(c *dtlsConfig) **x509.CertPool { return &c.ClientCAs }, pool))
+// Only servers consult the pool; clients accept it so that Resume can
+// re-apply the current policy to restored server connections.
+func WithClientCAs(pool *x509.CertPool) Option {
+	return valueOption(func(c *dtlsConfig) **x509.CertPool { return &c.ClientCAs }, pool)
 }
 
 // WithGetCertificate sets the certificate getter callback.

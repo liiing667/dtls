@@ -5,6 +5,7 @@ package dtls
 
 import (
 	"crypto/fips140"
+	"crypto/x509"
 	"errors"
 	"net"
 	"slices"
@@ -12,7 +13,9 @@ import (
 
 	dtlsconfig "github.com/pion/dtls/v4/internal/config"
 	dtlserrors "github.com/pion/dtls/v4/internal/errors"
+	dtlscrypto "github.com/pion/dtls/v4/internal/handshakecrypto"
 	cryptosuite "github.com/pion/dtls/v4/pkg/crypto/ciphersuite"
+	"github.com/pion/dtls/v4/pkg/crypto/signaturehash"
 	"github.com/pion/dtls/v4/pkg/protocol"
 )
 
@@ -23,11 +26,17 @@ func resumeWithConfig(state *State, conn net.PacketConn, rAddr net.Addr, config 
 	if state.CipherSuiteID == 0 {
 		return nil, dtlserrors.ErrCipherSuiteNotSet
 	}
+	if state.resumeToken == nil {
+		return nil, dtlserrors.ErrInvalidExportedState
+	}
 	if err := validateConfig(config); err != nil {
 		return nil, err
 	}
 	selected, err := resolveResumeCipherSuite(state, config)
 	if err != nil {
+		return nil, err
+	}
+	if err := verifyResumedPeerPolicy(state, config, selected); err != nil {
 		return nil, err
 	}
 	copyState := *state
@@ -37,7 +46,7 @@ func resumeWithConfig(state *State, conn net.PacketConn, rAddr net.Addr, config 
 	if err != nil {
 		return nil, err
 	}
-	if state.resumeToken == nil || !state.resumeToken.CompareAndSwap(false, true) {
+	if !state.resumeToken.CompareAndSwap(false, true) {
 		return nil, dtlserrors.ErrInvalidExportedState
 	}
 
@@ -110,8 +119,75 @@ func resolveResumeCipherSuite(state *State, config *dtlsConfig) (cryptosuite.Sui
 	return nil, &invalidCipherSuiteError{state.CipherSuiteID}
 }
 
+// verifyResumedPeerPolicy binds the restored connection to the current
+// authentication policy: the peer certificate chain is verified again against
+// the configured roots, name, and signature schemes, and the explicit
+// verification callbacks run as they would for a fresh handshake.
+func verifyResumedPeerPolicy(state *State, config *dtlsConfig, suite cryptosuite.Suite) error {
+	chains, err := verifyResumedCertificateChain(state, config, suite)
+	if err != nil {
+		return err
+	}
+	if config.VerifyPeerCertificate != nil && len(state.PeerCertificates) > 0 {
+		if err := config.VerifyPeerCertificate(state.PeerCertificates, chains); err != nil {
+			return err
+		}
+	}
+	if config.verifyConnection != nil {
+		return config.verifyConnection(state)
+	}
+
+	return nil
+}
+
+func verifyResumedCertificateChain(state *State, config *dtlsConfig, suite cryptosuite.Suite) ([][]*x509.Certificate, error) {
+	certAlgs, err := resumedCertSignatureSchemes(config)
+	if err != nil {
+		return nil, err
+	}
+	if state.isClient {
+		if len(state.PeerCertificates) == 0 && suite.AuthenticationType() == cryptosuite.AuthenticationTypeCertificate {
+			return nil, dtlserrors.ErrInvalidExportedState
+		}
+		if len(state.PeerCertificates) == 0 || config.InsecureSkipVerify {
+			return nil, nil //nolint:nilnil // PSK-authenticated, or verification was explicitly disabled.
+		}
+		serverName := config.ServerName
+		if serverName == "" {
+			serverName = state.ServerName
+		}
+
+		return dtlscrypto.VerifyServerCert(state.PeerCertificates, config.RootCAs, serverName, certAlgs)
+	}
+	if (config.ClientAuth == RequireAnyClientCert || config.ClientAuth == RequireAndVerifyClientCert) &&
+		len(state.PeerCertificates) == 0 {
+		return nil, dtlserrors.ErrClientCertificateRequired
+	}
+	if config.ClientAuth >= VerifyClientCertIfGiven && len(state.PeerCertificates) > 0 {
+		return dtlscrypto.VerifyClientCert(state.PeerCertificates, config.ClientCAs, certAlgs)
+	}
+
+	return nil, nil //nolint:nilnil // The current policy does not verify the peer chain.
+}
+
+func resumedCertSignatureSchemes(config *dtlsConfig) ([]signaturehash.Algorithm, error) {
+	signatureSchemes, certSignatureSchemes, err := parseConnSignatureSchemes(config)
+	if err != nil {
+		return nil, err
+	}
+	if len(certSignatureSchemes) > 0 {
+		return certSignatureSchemes, nil
+	}
+
+	return signatureSchemes, nil
+}
+
 // Resume imports state returned by ExportState, directly or after serialization.
 // ConnectionState snapshots and older serialized snapshots cannot be resumed.
+// The restored connection is bound to the current authentication policy: the
+// peer certificate chain is verified again against the configured RootCAs or
+// ClientCAs, server name, and signature schemes, and the VerifyPeerCertificate
+// and VerifyConnection callbacks run before the state is consumed.
 // Resume consumes the state;
 // serialized copies must not be reused, including in another process.
 func Resume(state *State, conn net.PacketConn, rAddr net.Addr, opts ...Option) (*Conn, error) {
