@@ -350,6 +350,127 @@ func TestECDHEPSKHandshake(t *testing.T) {
 	}
 }
 
+func TestSelectedSRTPProtectionProfile(t *testing.T) {
+	mki := []byte{1, 2, 3}
+	for _, tt := range []struct {
+		name           string
+		clientProfiles []SRTPProtectionProfile
+		serverProfiles []SRTPProtectionProfile
+		wantProfile    SRTPProtectionProfile
+	}{
+		{name: "disabled"},
+		{
+			name:           "single profile",
+			clientProfiles: []SRTPProtectionProfile{SRTP_AES128_CM_HMAC_SHA1_80},
+			serverProfiles: []SRTPProtectionProfile{SRTP_AES128_CM_HMAC_SHA1_80},
+			wantProfile:    SRTP_AES128_CM_HMAC_SHA1_80,
+		},
+		{
+			name:           "server preference replaces client order",
+			clientProfiles: []SRTPProtectionProfile{SRTP_AES128_CM_HMAC_SHA1_80, SRTP_AEAD_AES_128_GCM},
+			serverProfiles: []SRTPProtectionProfile{SRTP_AEAD_AES_128_GCM, SRTP_AES128_CM_HMAC_SHA1_80},
+			wantProfile:    SRTP_AEAD_AES_128_GCM,
+		},
+	} {
+		t.Run(tt.name, func(t *testing.T) {
+			certificate, err := selfsign.GenerateSelfSigned()
+			require.NoError(t, err)
+			clientOpts := []ClientOption{WithInsecureSkipVerify(true), WithSRTPMasterKeyIdentifier(mki)}
+			serverOpts := []ServerOption{WithCertificates(certificate), WithSRTPMasterKeyIdentifier(mki)}
+			if len(tt.clientProfiles) > 0 {
+				clientOpts = append(clientOpts, WithSRTPProtectionProfiles(tt.clientProfiles...))
+				serverOpts = append(serverOpts, WithSRTPProtectionProfiles(tt.serverProfiles...))
+			}
+			client, server := handshakePair(t,
+				clientOpts,
+				serverOpts,
+			)
+			require.NoError(t, client.configErr)
+			require.NoError(t, client.handshakeError)
+			require.NoError(t, server.configErr)
+			require.NoError(t, server.handshakeError)
+
+			for _, conn := range []*Conn{client.conn, server.conn} {
+				state, stateOK := conn.ConnectionState()
+				require.True(t, stateOK)
+				stateProfile, stateProfileOK := state.SelectedSRTPProtectionProfile()
+				profile, ok := conn.SelectedSRTPProtectionProfile()
+				peerMKI, mkiOK := conn.RemoteSRTPMasterKeyIdentifier()
+				if tt.wantProfile == 0 {
+					require.False(t, ok)
+					require.False(t, stateProfileOK)
+					require.False(t, mkiOK)
+
+					continue
+				}
+				require.True(t, ok)
+				require.Equal(t, tt.wantProfile, profile)
+				require.True(t, stateProfileOK)
+				require.Equal(t, profile, stateProfile)
+				require.True(t, mkiOK)
+				require.Equal(t, mki, peerMKI)
+			}
+			if tt.wantProfile == 0 {
+				return
+			}
+
+			// The exported media keys must come from the same context as the
+			// final profile.
+			clientState, ok := client.conn.ConnectionState()
+			require.True(t, ok)
+			serverState, ok := server.conn.ConnectionState()
+			require.True(t, ok)
+			clientKeys, err := clientState.ExportKeyingMaterial("EXTRACTOR-dtls_srtp", nil, 60)
+			require.NoError(t, err)
+			serverKeys, err := serverState.ExportKeyingMaterial("EXTRACTOR-dtls_srtp", nil, 60)
+			require.NoError(t, err)
+			require.Equal(t, clientKeys, serverKeys)
+		})
+	}
+}
+
+func TestSelectedSRTPProtectionProfileDuringHandshake(t *testing.T) {
+	ca, cb := packetPipe()
+	t.Cleanup(func() {
+		_ = ca.Close()
+		_ = cb.Close()
+	})
+	certificate, err := selfsign.GenerateSelfSigned()
+	require.NoError(t, err)
+	client, err := Client(ca, cb.LocalAddr(),
+		WithInsecureSkipVerify(true), WithCertificates(certificate),
+		WithSRTPProtectionProfiles(SRTP_AES128_CM_HMAC_SHA1_80), WithSRTPMasterKeyIdentifier([]byte{1, 2, 3}),
+	)
+	require.NoError(t, err)
+	t.Cleanup(func() { _ = client.Close() })
+
+	// Before the handshake starts no profile is selected.
+	_, ok := client.SelectedSRTPProtectionProfile()
+	require.False(t, ok)
+	_, ok = client.RemoteSRTPMasterKeyIdentifier()
+	require.False(t, ok)
+
+	ctx, cancel := context.WithCancel(context.Background())
+	defer cancel()
+	handshakeErr := make(chan error, 1)
+	go func() {
+		handshakeErr <- client.HandshakeContext(ctx)
+	}()
+
+	// Wait until the ClientHello arrives at the server end: the handshake is
+	// now in progress but not established.
+	require.NoError(t, cb.SetReadDeadline(time.Now().Add(5*time.Second)))
+	_, err = cb.Read(make([]byte, 2048))
+	require.NoError(t, err)
+	_, ok = client.SelectedSRTPProtectionProfile()
+	require.False(t, ok)
+	_, ok = client.RemoteSRTPMasterKeyIdentifier()
+	require.False(t, ok)
+
+	cancel()
+	require.Error(t, <-handshakeErr)
+}
+
 func TestExportKeyingMaterial(t *testing.T) {
 	const exportLabel = "EXTRACTOR-dtls_srtp"
 
@@ -2727,12 +2848,33 @@ func checkEarlyDataSRTP(t *testing.T, client, server *DetachedConn) {
 	t.Helper()
 	profiles := client.conn.handshakeConfig.LocalSRTPProtectionProfiles
 	if len(profiles) == 0 {
+		for _, conn := range []*DetachedConn{client, server} {
+			_, ok := conn.SelectedSRTPProtectionProfile()
+			require.False(t, ok)
+			_, ok = conn.RemoteSRTPMasterKeyIdentifier()
+			require.False(t, ok)
+		}
+
 		return
 	}
 	require.Equal(t, profiles[0], dtlsstate.CommonState(client.conn.state).SRTPProtectionProfile())
 	require.Equal(t, profiles[0], dtlsstate.CommonState(server.conn.state).SRTPProtectionProfile())
 	clientState, _ := client.conn.ConnectionState()
 	serverState, _ := server.conn.ConnectionState()
+	for _, pair := range []struct {
+		conn  *DetachedConn
+		state State
+	}{{client, clientState}, {server, serverState}} {
+		profile, ok := pair.conn.SelectedSRTPProtectionProfile()
+		require.True(t, ok)
+		require.Equal(t, profiles[0], profile)
+		stateProfile, ok := pair.state.SelectedSRTPProtectionProfile()
+		require.True(t, ok)
+		require.Equal(t, profile, stateProfile)
+		peerMKI, ok := pair.conn.RemoteSRTPMasterKeyIdentifier()
+		require.True(t, ok)
+		require.Equal(t, []byte{1, 2}, peerMKI)
+	}
 	clientKeys, err := clientState.ExportKeyingMaterial("EXTRACTOR-dtls_srtp", nil, 60)
 	require.NoError(t, err)
 	serverKeys, err := serverState.ExportKeyingMaterial("EXTRACTOR-dtls_srtp", nil, 60)

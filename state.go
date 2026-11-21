@@ -231,6 +231,18 @@ func (s *State) Role() Role {
 	return RoleServer
 }
 
+// SelectedSRTPProtectionProfile returns the SRTP protection profile negotiated
+// in this state, or false when use_srtp was not negotiated. Reading the
+// profile from the same State used for ExportKeyingMaterial keeps the profile
+// and the exported media keys in one consistent context.
+func (s *State) SelectedSRTPProtectionProfile() (SRTPProtectionProfile, bool) {
+	if s.srtpProtectionProfile == 0 {
+		return 0, false
+	}
+
+	return s.srtpProtectionProfile, true
+}
+
 func (s *State) serialize() (*serializedState, error) {
 	if s.resumeToken != nil && s.resumeToken.Load() {
 		return nil, dtlserrors.ErrInvalidExportedState

@@ -923,23 +923,35 @@ func (c *Conn) publishHandshakeState() {
 }
 
 // SelectedSRTPProtectionProfile returns the selected SRTPProtectionProfile.
+// The profile is only final once the handshake is established; before that
+// (0, false) is returned. The reported profile shares its context with
+// ConnectionState, so the profile, the exported keying material, the role,
+// and the handshake completion state always describe the same handshake.
 func (c *Conn) SelectedSRTPProtectionProfile() (SRTPProtectionProfile, bool) {
-	profile := dtlsstate.CommonState(c.state).SRTPProtectionProfile()
-	if profile == 0 {
+	if !c.isHandshakeCompletedSuccessfully() {
+		return 0, false
+	}
+	state, ok := c.ConnectionState()
+	if !ok {
 		return 0, false
 	}
 
-	return profile, true
+	return state.SelectedSRTPProtectionProfile()
 }
 
 // RemoteSRTPMasterKeyIdentifier returns the MasterKeyIdentifier value from the use_srtp.
+// Like SelectedSRTPProtectionProfile it is only final once the handshake is
+// established.
 func (c *Conn) RemoteSRTPMasterKeyIdentifier() ([]byte, bool) {
-	common := dtlsstate.CommonState(c.state)
-	if profile := common.SRTPProtectionProfile(); profile == 0 {
+	if !c.isHandshakeCompletedSuccessfully() {
+		return nil, false
+	}
+	state, ok := c.ConnectionState()
+	if !ok || state.srtpProtectionProfile == 0 {
 		return nil, false
 	}
 
-	return bytes.Clone(common.RemoteSRTPMasterKeyIdentifier), true
+	return bytes.Clone(state.peerSRTPMKI), true
 }
 
 func (c *Conn) writePackets(ctx context.Context, pkts []*dtlsflight.Outbound) error {
